@@ -1,0 +1,16 @@
+MyConfig defaults = new MyConfig();
+Configuration config = fromObject(defaults);
+
+
+RestartStrategy strategy = RestartStrategy.valueOf(
+    config.getString("restart.strategy", "NONE").toUpperCase()
+);
+
+env.setParallelism(4);
+env.setMaxParallelism(128);
+env.setRuntimeMode(RuntimeExecutionMode.STREAMING); // fallback if not set in config
+env.enableCheckpointing(10000); // Time in ms
+env.setRestartStrategy(RestartStrategies.fixedDelayRestart(3, Time.seconds(5)));
+env.setBufferTimeout(100); // In ms
+env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime); // Deprecated in 1.14+
+env.setStateBackend(new RocksDBStateBackend("file:///checkpoints")); // or use config!
