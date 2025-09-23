@@ -1,16 +1,84 @@
-MyConfig defaults = new MyConfig();
-Configuration config = fromObject(defaults);
+import json
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+from networkx.algorithms import community
 
+# ---- 1. Load ACL JSON ----
+with open("kafka_acls-small.json", "r") as f:
+    data = json.load(f)
 
-RestartStrategy strategy = RestartStrategy.valueOf(
-    config.getString("restart.strategy", "NONE").toUpperCase()
-);
+df = pd.DataFrame(data["acls"])
+print("ACL Data:\n", df)
 
-env.setParallelism(4);
-env.setMaxParallelism(128);
-env.setRuntimeMode(RuntimeExecutionMode.STREAMING); // fallback if not set in config
-env.enableCheckpointing(10000); // Time in ms
-env.setRestartStrategy(RestartStrategies.fixedDelayRestart(3, Time.seconds(5)));
-env.setBufferTimeout(100); // In ms
-env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime); // Deprecated in 1.14+
-env.setStateBackend(new RocksDBStateBackend("file:///checkpoints")); // or use config!
+# ---- 2. Build Weighted Graph ----
+G = nx.Graph()
+
+for _, row in df.iterrows():
+    user = row["principal"]
+    topic = row["topic"]
+    perm = row["operation"]
+
+    # Users and topics are nodes
+    G.add_node(user, type="user")
+    G.add_node(topic, type="topic")
+
+    # Weight: assign different values to operations
+    weight_map = {"READ": 1, "WRITE": 2, "ADMIN": 3}
+    weight = weight_map.get(perm, 1)
+
+    if G.has_edge(user, topic):
+        # If already exists, increase weight
+        G[user][topic]["weight"] += weight
+        G[user][topic]["operations"].append(perm)
+    else:
+        G.add_edge(user, topic, weight=weight, operations=[perm])
+
+print("\nGraph Nodes:", G.nodes(data=True))
+print("\nGraph Edges:", G.edges(data=True))
+
+# ---- 3. Detect Communities (Weighted Batches) ----
+communities = community.greedy_modularity_communities(G, weight="weight")
+
+batches = []
+for i, comm in enumerate(communities):
+    batches.append(list(comm))
+    print(f"\nBatch {i+1}: {list(comm)}")
+
+# ---- 4. Visualize Graph with Edge Weights ----
+plt.figure(figsize=(10,6))
+
+# Assign colors by community
+color_map = {}
+for i, comm in enumerate(communities):
+    for node in comm:
+        color_map[node] = i
+
+node_colors = [color_map[node] for node in G.nodes()]
+
+pos = nx.spring_layout(G, seed=42, weight="weight")
+nx.draw(G, pos, with_labels=True, node_color=node_colors, cmap=plt.cm.Set3,
+        node_size=1200, font_size=9, font_weight="bold", edge_color="gray")
+
+# Show edge labels (operations + weight)
+edge_labels = {
+    (u,v): f"{','.join(d['operations'])} (w={d['weight']})"
+    for u,v,d in G.edges(data=True)
+}
+nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
+
+plt.title("ACL Graph (Weighted by Permissions)", fontsize=14)
+plt.show()
+
+# ---- 5. Export Migration Plan ----
+migration_plan = []
+for i, comm in enumerate(communities):
+    users = [n for n in comm if n.startswith("User")]
+    topics = [n for n in comm if n.startswith("topic")]
+    migration_plan.append({
+        "batch": i+1,
+        "users": users,
+        "topics": topics
+    })
+
+print("\nMigration Plan JSON:\n", json.dumps(migration_plan, indent=2))
