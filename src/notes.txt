@@ -1,14 +1,11 @@
 import json
 import pandas as pd
-import networkx as nx
-import matplotlib.pyplot as plt
-from networkx.algorithms import community
 
 # ---- 1. Load ACL JSON ----
 with open("acls.json", "r") as f:
     data = json.load(f)
 
-# Flatten ACL entries into a DataFrame
+# ---- 2. Flatten into DataFrame ----
 rows = []
 for acl in data:
     pattern = acl["pattern"]
@@ -22,80 +19,27 @@ for acl in data:
     })
 
 df = pd.DataFrame(rows)
-print("ACL Data:\n", df)
 
-# ---- 2. Build Weighted Graph ----
-G = nx.Graph()
+# ---- 3. Group by user ----
+user_ops = df.groupby("user")["operation"].apply(set).reset_index()
 
-# Define operation weights (adjustable)
-weight_map = {"READ": 1, "WRITE": 2, "DESCRIBE": 0.5}
-
-for _, row in df.iterrows():
-    user = row["user"]
-    topic = row["topic"]
-    operation = row["operation"]
-    permission = row["permission"]
-
-    # Weight based on operation (skip DENY if needed)
-    weight = weight_map.get(operation, 1)
-    if permission != "ALLOW":
-        continue
-
-    G.add_node(user, type="user")
-    G.add_node(topic, type="topic")
-
-    if G.has_edge(user, topic):
-        # Accumulate weight if multiple ops
-        G[user][topic]["weight"] += weight
-        G[user][topic]["operations"].append(operation)
+# ---- 4. Categorize Users ----
+def categorize(ops):
+    if "READ" in ops and not any(op in ops for op in ["WRITE", "DELETE", "ALTER"]):
+        return "CONSUMER_ONLY"
+    elif "WRITE" in ops and not "READ" in ops:
+        return "PRODUCER_ONLY"
+    elif "READ" in ops and "WRITE" in ops:
+        return "HYBRID"
+    elif ops == {"DESCRIBE"}:
+        return "DESCRIBE_ONLY"
     else:
-        G.add_edge(user, topic, weight=weight, operations=[operation])
+        return "OTHER"
 
-print("\nGraph Nodes:", G.nodes(data=True))
-print("\nGraph Edges:", G.edges(data=True))
+user_ops["role"] = user_ops["operation"].apply(categorize)
 
-# ---- 3. Community Detection ----
-communities = community.greedy_modularity_communities(G, weight="weight")
+print("\nUser Roles:\n", user_ops)
 
-batches = []
-for i, comm in enumerate(communities):
-    batches.append(list(comm))
-    print(f"\nBatch {i+1}: {list(comm)}")
-
-# ---- 4. Visualization ----
-plt.figure(figsize=(12,7))
-
-# Assign colors per community
-color_map = {}
-for i, comm in enumerate(communities):
-    for node in comm:
-        color_map[node] = i
-
-node_colors = [color_map[node] for node in G.nodes()]
-pos = nx.spring_layout(G, seed=42, weight="weight")
-
-nx.draw(G, pos, with_labels=True, node_color=node_colors, cmap=plt.cm.Set3,
-        node_size=1400, font_size=9, font_weight="bold", edge_color="gray")
-
-# Edge labels show operations + weight
-edge_labels = {
-    (u,v): f"{','.join(d['operations'])} (w={d['weight']})"
-    for u,v,d in G.edges(data=True)
-}
-nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
-
-plt.title("ACL Graph (Users ↔ Topics, Weighted by Permissions)", fontsize=14)
-plt.show()
-
-# ---- 5. Export Migration Plan ----
-migration_plan = []
-for i, comm in enumerate(communities):
-    users = [n for n in comm if str(n).lower().startswith("user")]
-    topics = [n for n in comm if str(n).lower().startswith("topic")]
-    migration_plan.append({
-        "batch": i+1,
-        "users": users,
-        "topics": topics
-    })
-
-print("\nMigration Plan JSON:\n", json.dumps(migration_plan, indent=2))
+# ---- 5. Example: List Consumers Only ----
+consumers = user_ops[user_ops["role"] == "CONSUMER_ONLY"]
+print("\nConsumers Only:\n", consumers)
