@@ -1,11 +1,14 @@
 import json
 import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+from networkx.algorithms import community
 
 # ---- 1. Load ACL JSON ----
 with open("acls.json", "r") as f:
     data = json.load(f)
 
-# ---- 2. Flatten into DataFrame ----
+# ---- 2. Flatten ACLs into rows ----
 rows = []
 for acl in data:
     pattern = acl["pattern"]
@@ -14,16 +17,15 @@ for acl in data:
     rows.append({
         "user": entry["principal"],
         "topic": pattern["name"],
-        "operation": entry["operation"].upper(),
-        "permission": entry["permissiontype"].upper()
+        "permission": entry["operation"].upper()
     })
 
 df = pd.DataFrame(rows)
+print("\nACL Data:\n", df)
 
-# ---- 3. Group by user ----
-user_ops = df.groupby("user")["operation"].apply(set).reset_index()
+# ---- 3. Categorize Users (Consumer / Producer / Hybrid) ----
+user_ops = df.groupby("user")["permission"].apply(set).reset_index()
 
-# ---- 4. Categorize Users ----
 def categorize(ops):
     if "READ" in ops and not any(op in ops for op in ["WRITE", "DELETE", "ALTER"]):
         return "CONSUMER_ONLY"
@@ -36,10 +38,80 @@ def categorize(ops):
     else:
         return "OTHER"
 
-user_ops["role"] = user_ops["operation"].apply(categorize)
-
+user_ops["role"] = user_ops["permission"].apply(categorize)
 print("\nUser Roles:\n", user_ops)
 
-# ---- 5. Example: List Consumers Only ----
-consumers = user_ops[user_ops["role"] == "CONSUMER_ONLY"]
-print("\nConsumers Only:\n", consumers)
+# ---- 4. Build Graph ----
+G = nx.Graph()
+weight_map = {"READ": 1, "WRITE": 2, "DESCRIBE": 0.5}
+
+for _, row in df.iterrows():
+    user = row["user"]
+    topic = row["topic"]
+    perm = row["permission"]
+    weight = weight_map.get(perm, 1)
+
+    G.add_node(user, type="user")
+    G.add_node(topic, type="topic")
+
+    if G.has_edge(user, topic):
+        G[user][topic]["weight"] += weight
+        G[user][topic]["permissions"].append(perm)
+    else:
+        G.add_edge(user, topic, weight=weight, permissions=[perm])
+
+# ---- 5. Community Detection (Optional) ----
+communities = community.greedy_modularity_communities(G, weight="weight")
+
+# ---- 6. Impact Analysis Function ----
+def migration_impact(user_id):
+    if user_id not in G:
+        return {"error": f"{user_id} not found"}
+
+    # All topics this user is linked to
+    topics = [n for n in nx.neighbors(G, user_id) if G.nodes[n]["type"] == "topic"]
+
+    # All other users linked to those topics
+    impacted_users = set()
+    for topic in topics:
+        impacted_users.update([n for n in nx.neighbors(G, topic) if G.nodes[n]["type"] == "user"])
+    impacted_users.discard(user_id)
+
+    # Roles for impacted users
+    roles_lookup = dict(zip(user_ops["user"], user_ops["role"]))
+    impacted_with_roles = {u: roles_lookup.get(u, "UNKNOWN") for u in impacted_users}
+
+    return {
+        "migrating_user": user_id,
+        "topics_moved": topics,
+        "impacted_users": impacted_with_roles
+    }
+
+# ---- 7. Example Impact Checks ----
+print("\nImpact if migrating 'user 1':")
+print(json.dumps(migration_impact("user 1"), indent=2))
+
+print("\nImpact if migrating 'user 2':")
+print(json.dumps(migration_impact("user 2"), indent=2))
+
+# ---- 8. Visualization ----
+plt.figure(figsize=(12,7))
+color_map = {}
+for i, comm in enumerate(communities):
+    for node in comm:
+        color_map[node] = i
+
+node_colors = [color_map[node] for node in G.nodes()]
+pos = nx.spring_layout(G, seed=42, weight="weight")
+
+nx.draw(G, pos, with_labels=True, node_color=node_colors, cmap=plt.cm.Set3,
+        node_size=1400, font_size=9, font_weight="bold", edge_color="gray")
+
+edge_labels = {
+    (u,v): f"{','.join(set(d['permissions']))} (w={d['weight']})"
+    for u,v,d in G.edges(data=True)
+}
+nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
+
+plt.title("ACL Graph with Migration Impact", fontsize=14)
+plt.show()
